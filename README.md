@@ -115,7 +115,7 @@ events
 
 committed_event_ids                # idempotency
 persistent_subscriptions           # durable group checkpoint
-persistent_acks                    # delivered/in-flight ACK state
+persistent_acks                    # delivered/in-flight/completed ACK state
 snapshots
 projection_checkpoints
 schema_info
@@ -175,7 +175,7 @@ Polling and shutdown waits use scheduler-friendly Zig `std.Io` sleeps for time-b
 
 ## Persistent subscriptions
 
-Persistent subscriptions store delivered/in-flight state in SQLite and maintain a durable contiguous ACK frontier.
+Persistent subscriptions store delivered/in-flight/completed state in SQLite and maintain a durable contiguous ACK frontier.
 
 The meaning of `persistent_subscriptions.last_position` is:
 
@@ -186,12 +186,17 @@ This matters when ACKs arrive out of order. For delivered revisions `0, 1, 2`:
 ```text
 ACK 2  -> checkpoint remains 0
 ACK 0  -> checkpoint becomes 1
+ACK 0  -> checkpoint remains 1 (idempotent duplicate)
 ACK 1  -> checkpoint becomes 3
 ```
 
-An ACK beyond a gap is stored durably but cannot move the checkpoint through an earlier incomplete revision. ACK mutation, checkpoint advancement and completed-row compaction happen in one SQLite transaction under writer serialization.
+An ACK beyond a gap is stored durably but cannot move the checkpoint through an earlier incomplete revision. ACK mutation and checkpoint advancement happen in one SQLite transaction under writer serialization.
+
+Completed ACK rows are retained in v0.1. This preserves duplicate-ACK idempotency and lets restart skip an event that was already completed beyond an earlier gap. Any future compaction mechanism must preserve that observable contract before deleting completion records.
 
 NACK and parked state do not advance the checkpoint implicitly.
+
+A file-backed regression test closes and reopens the database between out-of-order ACKs to verify that both the checkpoint and later completion state survive SQLite reopen.
 
 ## Connection and concurrency model
 
@@ -240,6 +245,12 @@ pub const OpenOptions = struct {
 ```
 
 There is intentionally no `max_connections` option in v0.1 because there is no connection pool to enforce such a value.
+
+## Writer synchronization
+
+Same-process writer mutations are serialized by an adaptive lock. It spins only through a short bounded fast path; if contention lasts longer, the waiter yields through `std.Io.sleep` before retrying. This avoids burning a CPU core while the current owner is waiting inside SQLite/WAL I/O.
+
+Cross-process contention remains governed by SQLite and `busy_timeout`.
 
 ## Client lifetime
 
@@ -321,11 +332,13 @@ Implemented and exercised by the current suite:
 - configurable bounded subscription buffers with backpressure;
 - persistent subscription create/connect/delete;
 - durable contiguous ACK checkpoint semantics;
+- duplicate persistent ACK idempotency;
+- file-backed persistent checkpoint/reopen regression coverage;
 - NACK/park state persistence;
 - snapshots;
 - stream metadata/tombstones;
 - projection checkpoints;
-- schema migrations;
+- forward-only schema migrations;
 - optional file-backed dedicated read connection;
 - DCB schema support;
 - Linux and Windows CI configuration.
@@ -337,6 +350,7 @@ Still evolving:
 - network/HTTP protocol surface;
 - parked-message replay/resolution API;
 - first-class DCB read/conditional-append helpers;
+- completion-record compaction that preserves idempotency/restart evidence;
 - eventual package/import rename from compatibility name `eventstoredb` to `eventszite`.
 
 ## License
