@@ -282,6 +282,9 @@ pub const PersistentSubscription = struct {
 
     /// Mark one delivered event complete and advance the durable checkpoint
     /// only through the highest contiguous completed revision.
+    ///
+    /// Completed rows are retained in v0.1 so a duplicate ACK remains
+    /// idempotent even after the durable frontier has advanced past it.
     pub fn ack(self: *PersistentSubscription, ev_id: types.Uuid) errors_mod.Error!void {
         if (self.closed) return error.SubscriptionClosed;
         if (self.client.closed.load(.seq_cst)) return error.DatabaseClosed;
@@ -294,7 +297,7 @@ pub const PersistentSubscription = struct {
         var tx_open = true;
         defer if (tx_open) conn.exec("ROLLBACK") catch {};
 
-        const event_number = try findInflightEventNumber(conn, self.group_name, self.stream_id, ev_id);
+        _ = try findInflightEventNumber(conn, self.group_name, self.stream_id, ev_id);
 
         const mark = try bind.prepare(conn.db, conn.allocator, "UPDATE persistent_acks SET acked = 1 WHERE group_name = ? AND stream_id = ? AND event_id = ?");
         defer bind.finalize(conn.allocator, mark);
@@ -302,7 +305,6 @@ pub const PersistentSubscription = struct {
         _ = bind.bindText(mark, 2, self.stream_id);
         _ = bind.bindBlob(mark, 3, &ev_id);
         if (c.sqlite3_step(mark) != c.SQLITE_DONE) return error.Sqlite;
-        _ = event_number;
 
         const checkpoint = try readGroupCheckpoint(conn, self.group_name, self.stream_id);
         const first_incomplete = try queryFrontierScalar(
@@ -333,15 +335,6 @@ pub const PersistentSubscription = struct {
         _ = bind.bindText(update, 3, self.group_name);
         _ = bind.bindText(update, 4, self.stream_id);
         if (c.sqlite3_step(update) != c.SQLITE_DONE) return error.Sqlite;
-
-        // Completed rows below the durable frontier can no longer affect
-        // replay or out-of-order ACK calculation and are safe to compact.
-        const cleanup = try bind.prepare(conn.db, conn.allocator, "DELETE FROM persistent_acks WHERE group_name = ? AND stream_id = ? AND acked = 1 AND event_number < ?");
-        defer bind.finalize(conn.allocator, cleanup);
-        _ = bind.bindText(cleanup, 1, self.group_name);
-        _ = bind.bindText(cleanup, 2, self.stream_id);
-        _ = bind.bindI64(cleanup, 3, frontier);
-        if (c.sqlite3_step(cleanup) != c.SQLITE_DONE) return error.Sqlite;
 
         try conn.exec("COMMIT");
         tx_open = false;
@@ -481,8 +474,8 @@ fn runPS(ctx: *PSRunContext) void {
 
             if (existing) |state| {
                 ctx.client.writer_mu.unlock();
-                // An ACK recorded beyond an earlier gap must survive restart.
-                // Skip it during replay rather than resetting it to incomplete.
+                // Completed events beyond an earlier gap remain recorded so
+                // replay can skip them and duplicate ACKs stay idempotent.
                 if (state.acked or state.parked) {
                     cursor = ev.revision + 1;
                     types.freeEvent(ctx.allocator, ev);
