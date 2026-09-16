@@ -11,20 +11,46 @@ The public Zig API models familiar EventStoreDB concepts:
 - global log positions;
 - stream and `$all` reads;
 - catch-up subscriptions;
-- persistent-subscription-like consumer groups;
+- embedded persistent consumer groups;
 - stream metadata, snapshots, projection checkpoints and tombstones.
 
 The Zig import name remains `eventstoredb` for source compatibility during the EventsZite rename.
 
+## Persistent subscription semantics implemented in EventsZite
+
+EventsZite persistent subscriptions are an embedded SQLite consumer-group implementation, not an implementation of the EventStoreDB network protocol.
+
+The tested v0.1 contract includes:
+
+- delivery state is persisted before the event is handed to the consumer;
+- `persistent_subscriptions.last_position` is the next stream revision that is not durably complete;
+- out-of-order ACKs are retained but cannot cross an earlier incomplete revision;
+- duplicate ACK of a delivered/completed event is idempotent;
+- ACK state and contiguous checkpoint advancement are committed transactionally;
+- NACK/park state does not implicitly advance the checkpoint;
+- ACKed events beyond an earlier gap remain durable and are skipped after reconnect/reopen;
+- file-backed close/reopen regression tests verify the checkpoint and out-of-order ACK state survive SQLite reopen.
+
+Completed ACK rows are retained in v0.1 to preserve duplicate-ACK idempotency and restart evidence. A future compaction mechanism must preserve the same observable contract.
+
 ## What is not compatible
 
-EventsZite currently does not implement the EventStoreDB gRPC/TCP wire protocols, server clustering, quorum replication, server-side projections, authentication/authorization semantics, or the full persistent subscription protocol.
+EventsZite currently does not implement:
 
-Persistent subscriptions in v0.1 should be treated as an embedded consumer-group implementation. Delivery/in-flight tracking exists, but full restart/checkpoint semantics and parity with EventStoreDB persistent subscriptions are still incomplete.
+- EventStoreDB gRPC/TCP wire protocols;
+- server clustering or quorum replication;
+- official EventStoreDB authentication/authorization semantics;
+- server-side projections;
+- the complete EventStoreDB persistent-subscription protocol and management surface;
+- transparent compatibility with official EventStoreDB clients.
 
 ## Concurrency model
 
-SQLite remains the durability and serialization boundary. EventsZite uses one writer connection per `Client`. `OpenOptions.separate_read_connection = true` opens a second connection for subscription workers and is recommended when append and subscription load run concurrently.
+SQLite remains the durability and serialization boundary. EventsZite uses one writer connection per `Client` and optionally one dedicated subscription-read connection for file-backed databases.
+
+`separate_read_connection = true` is rejected for plain `:memory:` databases because separate SQLite `:memory:` connections are separate databases.
+
+Writer contention uses a bounded adaptive lock: a short spin fast path followed by scheduler-friendly sleep while another writer remains inside SQLite.
 
 ## Compatibility policy
 
