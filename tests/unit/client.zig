@@ -1,6 +1,4 @@
-//! Unit tests for the `Client` lifecycle: `open`, `close`,
-//! `lastLogPosition`, `stats`, and the `DatabaseClosed` short
-//! circuit that every other method shares.
+//! Unit tests for the `Client` lifecycle and connection policy.
 
 const std = @import("std");
 const testing = std.testing;
@@ -38,17 +36,16 @@ test "client: stats reflect the contents" {
     const c = try common.newClient(a);
     defer c.close();
 
-    {
-        const r = try esdb.appendToStream(c, a, "s1", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
-            .{ .event_type = "X", .data = "1" },
-        });
-        defer esdb.freeEvents(a, r.events);
-    }
-    const res = try esdb.appendToStream(c, a, "s2", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
+    const r1 = try esdb.appendToStream(c, a, "s1", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
+        .{ .event_type = "X", .data = "1" },
+    });
+    defer esdb.freeEvents(a, r1.events);
+
+    const r2 = try esdb.appendToStream(c, a, "s2", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
         .{ .event_type = "Y", .data = "1" },
         .{ .event_type = "Y", .data = "2" },
     });
-    defer esdb.freeEvents(a, res.events);
+    defer esdb.freeEvents(a, r2.events);
 
     const stats = try c.stats();
     try testing.expectEqual(@as(i64, 2), stats.stream_count);
@@ -58,14 +55,7 @@ test "client: stats reflect the contents" {
     try testing.expectEqual(@as(u64, 3), stats.last_log_position);
 }
 
-test "client: closed client returns DatabaseClosed" {
-    // `Client.close` is destructive: the backing struct is freed
-    // and must not be touched again. We exercise the "closed"
-    // sentinel by appending once, calling `close`, and verifying
-    // a follow-up call (which will fault) is not issued. The
-    // `closed.load` check inside every entry point is the only
-    // contract that matters and is covered by the source comment
-    // in `client.zig`.
+test "client: close is destructive" {
     const a = testing.allocator;
     const c = try common.newClient(a);
     const r = try esdb.appendToStream(c, a, "s", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
@@ -73,43 +63,36 @@ test "client: closed client returns DatabaseClosed" {
     });
     defer esdb.freeEvents(a, r.events);
     c.close();
-    // Skipped: use-after-free is not a useful thing to assert.
-}
-
-test "client: closing twice is a no-op" {
-    const c = try common.newClient(testing.allocator);
-    c.close();
-    // Skipped: second close would be a double-free. Document
-    // the contract in `client.zig` instead.
 }
 
 test "client: reopening on a stale path returns CannotOpenDatabase" {
-    // An obviously invalid path (a directory that doesn't exist).
     try testing.expectError(error.CannotOpenDatabase, esdb.Client.open(common.conn_alloc, .{
         .path = "/this/dir/really/does/not/exist/store.db",
     }));
 }
 
-test "client: separate_read_connection opens and closes without leaking the read handle" {
-    // Regression for the `read_conn` lifecycle path. With
-    // `separate_read_connection = true`, `Client.close` must
-    // release the second `Connection` exactly once; previously
-    // this branch was untested because no test exercised it.
-    //
-    // `:memory:` would create two private databases; we use a
-    // per-test temp file under the workspace so writer and
-    // reader share the same store AND a previous run's
-    // leftover data never trips `.no_stream`.
-    var threaded = std.Io.Threaded.init_single_threaded;
+test "client: plain memory store rejects separate read connection" {
+    try testing.expectError(error.UnsupportedConfiguration, esdb.Client.open(common.conn_alloc, .{
+        .path = ":memory:",
+        .separate_read_connection = true,
+    }));
+}
+
+test "client: file store supports separate read connection" {
+    var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
     const ts = std.Io.Clock.now(.real, io);
-    var path_buf: [256]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buf,
-        "D:\\www\\Freelas\\_____suissadev\\Conceitos\\AllasCode\\Planes\\Data\\EventStoreDB-zig\\client-separate-read-conn-{x}.db",
-        .{@as(u64, @intCast(ts.nanoseconds))},
-    );
-    defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+
+    var path_buf: [128]u8 = undefined;
+    var wal_buf: [140]u8 = undefined;
+    var shm_buf: [140]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "client-separate-read-{x}.db", .{@as(u64, @intCast(ts.nanoseconds))});
+    const wal_path = try std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path});
+    const shm_path = try std.fmt.bufPrint(&shm_buf, "{s}-shm", .{path});
+
+    defer std.Io.Dir.cwd().deleteFile(io, shm_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const c = try esdb.Client.open(common.conn_alloc, .{
         .path = path,
@@ -120,14 +103,23 @@ test "client: separate_read_connection opens and closes without leaking the read
         .{ .event_type = "X", .data = "1" },
     });
     defer esdb.freeEvents(a, r.events);
-    // Read through the same code path the subscription
-    // workers take; verifies the read connection is wired
-    // correctly. `sub.close()` joins the worker which still
-    // holds a pointer to `c`, so close the subscription
-    // first. (`var` because `Subscription` carries the
-    // queue/sentinel state — `const` would fail the
-    // auto-addressing to the mutable receiver.)
-    var sub = try esdb.subscribeToAll(c, a, .{ .from = .{ .end = {} }, .poll_interval_ms = 5 });
-    sub.close();
-    c.close(); // exercises the read_conn teardown
+
+    var sub = try esdb.subscribeToAll(c, a, .{ .from = .{ .start = {} }, .poll_interval_ms = 5 });
+    defer sub.close();
+
+    const deadline: i128 = common.nowNs() + std.time.ns_per_s;
+    var seen = false;
+    while (!seen and common.nowNs() < deadline) {
+        if (sub.tryReceive()) |item| {
+            switch (item) {
+                .event => |ev| {
+                    seen = true;
+                    esdb.freeEvent(a, ev);
+                },
+                .err => return item.err,
+                .closed => break,
+            }
+        } else std.atomic.spinLoopHint();
+    }
+    try testing.expect(seen);
 }

@@ -35,14 +35,16 @@ pub const Error = error{
     DatabaseClosed,
     /// Caller-supplied argument is invalid.
     InvalidArgument,
+    /// The requested option combination cannot be implemented
+    /// safely by the current storage model.
+    UnsupportedConfiguration,
     /// A query yielded no rows where at least one was expected.
     NotFound,
     /// `sqlite3_prepare_v2` returned SQLITE_OK but the handle
     /// is null (defensive — should not happen in practice).
     PrepareFailed,
     /// Catch-all for a SQLite C API call that returned an error
-    /// code other than the ones we map explicitly. The raw
-    /// `sqlite3_*errmsg` is included in the `message` field.
+    /// code other than the ones we map explicitly.
     Sqlite,
     /// `std.heap.OutOfMemory` propagated from an allocator.
     OutOfMemory,
@@ -51,7 +53,7 @@ pub const Error = error{
 /// Carries the actual and expected revisions for an
 /// `appendToStream` that failed because of a mismatch.
 pub const WrongExpectedVersionError = struct {
-    expected: []const u8, // human-readable form
+    expected: []const u8,
     actual: u64,
     stream: []const u8,
 
@@ -66,22 +68,16 @@ pub const WrongExpectedVersionError = struct {
     }
 };
 
-/// Result of a failed `appendToStream` carries the typed error
-/// so callers can branch on it without parsing strings.
 pub const AppendError = Error || std.mem.Allocator.Error;
 
-/// Convert a SQLite return code into a typed `Error`. Returns
-/// `null` for `SQLITE_OK` and `SQLITE_ROW` / `SQLITE_DONE`.
 pub fn fromSqlite(rc: c_int) ?Error {
     return switch (rc) {
         c.SQLITE_OK, c.SQLITE_ROW, c.SQLITE_DONE => null,
-        c.SQLITE_BUSY, c.SQLITE_LOCKED => Error.Sqlite, // could refine
+        c.SQLITE_BUSY, c.SQLITE_LOCKED => Error.Sqlite,
         else => Error.Sqlite,
     };
 }
 
-/// Get the SQLite error message from a connection. Caller owns
-/// the returned slice and must free it with the allocator.
 pub fn errorMessage(allocator: std.mem.Allocator, db: *c.sqlite3) ![]u8 {
     const cstr = c.sqlite3_errmsg(db);
     return allocator.dupe(u8, std.mem.span(cstr));
