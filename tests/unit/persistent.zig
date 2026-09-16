@@ -116,6 +116,105 @@ test "persistent: out-of-order ACK never crosses an incomplete gap" {
     try sub.ack(ids[0]);
     try testing.expectEqual(@as(u64, 1), sub.last_position);
 
+    // Duplicate ACK is a durable idempotent no-op.
+    try sub.ack(ids[0]);
+    try testing.expectEqual(@as(u64, 1), sub.last_position);
+
     try sub.ack(ids[1]);
     try testing.expectEqual(@as(u64, 3), sub.last_position);
+
+    try sub.ack(ids[2]);
+    try testing.expectEqual(@as(u64, 3), sub.last_position);
+}
+
+test "persistent: checkpoint and out-of-order ACK state survive database reopen" {
+    const a = testing.allocator;
+    var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
+    const stamp = std.Io.Clock.now(.real, io).nanoseconds;
+
+    var path_buf: [128]u8 = undefined;
+    var wal_buf: [140]u8 = undefined;
+    var shm_buf: [140]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "persistent-reopen-{x}.db", .{@as(u64, @intCast(stamp))});
+    const wal_path = try std.fmt.bufPrint(&wal_buf, "{s}-wal", .{path});
+    const shm_path = try std.fmt.bufPrint(&shm_buf, "{s}-shm", .{path});
+    defer std.Io.Dir.cwd().deleteFile(io, shm_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, wal_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var ids: [3]esdb.Uuid = undefined;
+
+    // Phase 1: ACK 2 and 0, leaving revision 1 as the durable gap.
+    {
+        const c = try esdb.Client.open(a, .{ .path = path, .poll_interval_ms = 2 });
+        const r = try esdb.appendToStream(c, a, "restart", .{ .expected_revision = .no_stream }, &[_]esdb.EventData{
+            .{ .event_type = "X", .data = "0" },
+            .{ .event_type = "X", .data = "1" },
+            .{ .event_type = "X", .data = "2" },
+        });
+        esdb.freeEvents(a, r.events);
+        try esdb.createPersistentSubscription(c, a, "restart", "g", .{ .group_name = "g" }, .{}, false);
+        var sub = try esdb.connectPersistentSubscription(c, a, "restart", "g");
+
+        var received: usize = 0;
+        const deadline = common.nowNs() + 2 * std.time.ns_per_s;
+        while (received < ids.len and common.nowNs() < deadline) {
+            if (sub.tryReceive()) |item| switch (item) {
+                .message => |msg| {
+                    ids[received] = msg.event.event_id;
+                    esdb.freeEvent(a, msg.event);
+                    received += 1;
+                },
+                .err => return item.err,
+                .closed => break,
+            } else std.atomic.spinLoopHint();
+        }
+        try testing.expectEqual(@as(usize, 3), received);
+        try sub.ack(ids[2]);
+        try sub.ack(ids[0]);
+        try testing.expectEqual(@as(u64, 1), sub.last_position);
+        sub.close();
+        c.close();
+    }
+
+    // Phase 2: reopening starts from revision 1; revision 2 remains recorded
+    // as already ACKed and is skipped instead of being redelivered.
+    {
+        const c = try esdb.Client.open(a, .{ .path = path, .poll_interval_ms = 2 });
+        var sub = try esdb.connectPersistentSubscription(c, a, "restart", "g");
+        try testing.expectEqual(@as(u64, 1), sub.last_position);
+
+        var got_revision_one = false;
+        const deadline = common.nowNs() + 2 * std.time.ns_per_s;
+        while (!got_revision_one and common.nowNs() < deadline) {
+            if (sub.tryReceive()) |item| switch (item) {
+                .message => |msg| {
+                    try testing.expectEqual(@as(u64, 1), msg.event.revision);
+                    got_revision_one = true;
+                    esdb.freeEvent(a, msg.event);
+                },
+                .err => return item.err,
+                .closed => break,
+            } else std.atomic.spinLoopHint();
+        }
+        try testing.expect(got_revision_one);
+
+        try sub.ack(ids[1]);
+        try testing.expectEqual(@as(u64, 3), sub.last_position);
+        // ACK retained completion again after reopen.
+        try sub.ack(ids[2]);
+        try testing.expectEqual(@as(u64, 3), sub.last_position);
+        sub.close();
+        c.close();
+    }
+
+    // Phase 3: durable checkpoint itself survived close/reopen.
+    {
+        const c = try esdb.Client.open(a, .{ .path = path, .poll_interval_ms = 2 });
+        var sub = try esdb.connectPersistentSubscription(c, a, "restart", "g");
+        try testing.expectEqual(@as(u64, 3), sub.last_position);
+        sub.close();
+        c.close();
+    }
 }
