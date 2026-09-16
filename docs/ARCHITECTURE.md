@@ -1,248 +1,186 @@
-# Architecture
+# EventsZite architecture
 
-This document describes the internal design of `eventstoredb-zig`:
-how events are stored, how concurrency is handled, and how the
-subscription engine works.
+EventsZite is an embedded event store written in Zig and backed by a vendored SQLite amalgamation. The current public import remains `eventstoredb` for source compatibility, but the product and repository identity is **EventsZite**.
 
-> **Status:** v0.1. Work in progress; see [EVENTSTOREDB-COMPATIBILITY.md](./EVENTSTOREDB-COMPATIBILITY.md) for the API surface.
-
----
+See [`EVENTSTOREDB-COMPATIBILITY.md`](./EVENTSTOREDB-COMPATIBILITY.md) for the compatibility boundary.
 
 ## High-level shape
 
-```
-   ┌──────────────────────────────────────────────┐
-   │  Your Zig app                               │
-   │  ┌──────────────────────────────────────┐   │
-   │  │  eventstoredb.Client                 │   │
-   │  │   ├─ Open / Close / Stats            │   │
-   │  │   ├─ Append / Read / Subscribe       │   │
-   │  │   ├─ Persistent Subscriptions        │   │
-   │  │   └─ Snapshots / Meta                │   │
-   │  └────────────┬─────────────────────────┘   │
-   │               │  database/sql (via cImport)  │
-   │  ┌────────────▼─────────────────────────┐   │
-   │  │  vendored SQLite amalgamation        │   │
-   │  │   compiled as a static lib,           │   │
-   │  │   linked into the library/CLI.        │   │
-   │  └────────────┬─────────────────────────┘   │
-   │               │                              │
-   │  ┌────────────▼─────────────────────────┐   │
-   │  │  SQLite file (single .db + .db-wal)   │   │
-   │  │   ├─ streams                          │   │
-   │  │   ├─ events (heart)                  │   │
-   │  │   ├─ committed_event_ids (idempotency)│   │
-   │  │   ├─ persistent_subscriptions        │   │
-   │  │   ├─ persistent_acks                 │   │
-   │  │   ├─ snapshots                       │   │
-   │  │   └─ schema_info                     │   │
-   │  └──────────────────────────────────────┘   │
-   └──────────────────────────────────────────────┘
+```text
+Zig application
+  |
+  v
+EventsZite Client
+  |- append / read
+  |- catch-up subscriptions
+  |- persistent subscriptions
+  |- snapshots / metadata / projections
+  |
+  v
+SQLite WAL
+  |- streams
+  |- events
+  |- committed_event_ids
+  |- persistent_subscriptions
+  |- persistent_acks
+  |- snapshots
+  |- projection_checkpoints
+  `- schema_info
 ```
 
-The library is a single Go module. There is no daemon process.
-The in-process `Client` is the daemon. The CLI exists to expose
-`stats` and a `tail` for live event streaming.
-
----
+There is no required daemon. The library is embedded in the caller process. The CLI is an optional operational surface, not the durability authority.
 
 ## Storage model
 
-The schema is identical to the Go port (`eventstoredb-sqlite`).
-See the inline comments in [`src/schema.zig`](../src/schema.zig)
-for the canonical DDL.
-
-Salient tables:
+The canonical schema is defined in [`src/schema.zig`](../src/schema.zig). Current schema version: **3**.
 
 ### `events`
 
-```
-event_id              BLOB NOT NULL              -- 16 bytes UUID
-stream_id             TEXT NOT NULL
-event_number          INTEGER NOT NULL           -- 0-based per-stream
-log_position          INTEGER NOT NULL UNIQUE   -- global commit order
-transaction_position  INTEGER NOT NULL
-event_type            TEXT NOT NULL
-data                  BLOB NOT NULL
-metadata              BLOB
-created_at            INTEGER NOT NULL           -- unix epoch ms
-PRIMARY KEY (stream_id, event_number)
-```
+Important coordinates are deliberately separate:
 
-- `PRIMARY KEY (stream_id, event_number)` matches the B-tree layout
-  used by EventStoreDB for the per-stream log. Range scans by
-  revision are O(log n).
-- `log_position` is 1-based; the first event appended to an empty
-  store gets position 1. This matches `MAX(log_position) + 1` on
-  the next insert, which gives a dense, gap-free global ordering.
-- `transaction_position` groups events written in the same Append
-  call. Multi-stream transactions (planned for v0.2) will share
-  the same `transaction_position`.
-- `event_type` is indexed for projection lookups.
+- `event_number`: zero-based revision inside one stream;
+- `log_position`: global append order in the database;
+- `transaction_position`: groups events committed by one append operation.
 
-### `committed_event_ids`
+The DCB extension adds nullable `sequence`, `tags` and `dc_time` fields.
 
-A separate table for idempotency. The PK lookup is O(1) so a
-retrying append that reuses an `event_id` pays a single index
-probe instead of scanning `events`.
+### Idempotency
 
-### `streams`
+`committed_event_ids` provides a direct lookup by caller-supplied event ID. Retrying the same logical append with the same ID does not require scanning the event log.
 
-Per-stream metadata. The `deleted_at` column implements
-tombstoning: appends and reads fail with `StreamTombstoned`
-once a stream is soft-deleted, but the events remain on disk
-so a restorer can rebuild state if needed.
+### Streams
 
-### `persistent_subscriptions` + `persistent_acks`
+`streams` stores the current revision plus metadata/truncation/tombstone state. Tombstoning prevents normal append/read operations while preserving historical rows for audit/recovery policy.
 
-Two tables per consumer group:
+### Persistent subscriptions
 
-- `persistent_subscriptions` carries the configuration, the
-  per-group cursor, and a `status` enum (`Live`, `Paused`).
-- `persistent_acks` is the in-flight queue. A row exists for
-  each event that has been delivered to a consumer and is
-  waiting on `Ack`/`Nack`. Parked messages have `parked = 1`.
+`persistent_subscriptions.last_position` means:
 
-### `snapshots` and `projection_checkpoints`
+> the next stream revision that is not durably complete.
 
-- `snapshots` is the per-stream aggregate snapshot store,
-  keyed by `(stream_id, revision)`. Multiple revisions are
-  retained; callers garbage-collect in a background job.
-- `projection_checkpoints` makes user-defined projections
-  restartable: a `last_processed_position` row per projection
-  name.
+`persistent_acks` stores durable delivery state for each consumer-group event, including:
 
----
+- `event_id`;
+- `event_number` (stream coordinate);
+- `log_position` (global coordinate, retained separately);
+- retry count;
+- parked state;
+- durable `acked` state.
+
+Completed rows are retained in v0.1. This makes duplicate ACKs idempotent and preserves evidence needed to skip an already-completed event after a restart when it sits beyond an earlier gap. A future compaction design must preserve those semantics before deleting completion records.
+
+## Schema migrations
+
+Migrations are forward-only and versioned.
+
+Version-specific indexes are created only after the columns they depend on exist. This is important for old databases: base DDL must not reference a v2/v3 column before the corresponding `ALTER TABLE` migration has run.
+
+Version 2 adds the DCB event fields and indexes. Version 3 adds persistent `event_number` and `acked` state, backfills existing in-flight rows from `events`, and creates the persistent frontier index.
 
 ## Concurrency model
 
-SQLite is single-writer per file. The library embraces this:
+SQLite is the storage serialization boundary. EventsZite v0.1 deliberately uses a small connection model rather than pretending to expose a generic pool:
 
-1. **Process-level spinlock** (`Client.writer_mu`): every
-   `appendToStream` call acquires it before opening its
-   transaction. This serializes appends within the process, so
-   we never get `SQLITE_BUSY` from a same-process race.
-2. **PRAGMA journal_mode = WAL**: readers never block on
-   writers and vice versa.
-3. **PRAGMA synchronous = NORMAL**: trades a small durability
-   window (last transaction may roll back on a power loss) for
-   ~10x write throughput. Acceptable for an append-only store.
-4. **PRAGMA busy_timeout = 5000ms**: covers the cross-process
-   `SQLITE_BUSY` case.
+```text
+1 canonical writer connection
++ optional 1 subscription-read connection for file-backed stores
+```
 
-### Subscription delivery
+There is no `max_connections` option because there is no generic connection pool to enforce it.
 
-`SubscribeToStream` and `SubscribeToAll` are catch-up
-subscriptions:
+### Writer serialization
 
-1. Read a page of events from the cursor position.
-2. Push them onto the buffered channel.
-3. Update the cursor.
-4. If we drained a full page, immediately loop (more may be
-   available). Otherwise wait for the broadcast waker
-   (signalled at the end of every `AppendToStream`) or the
-   poll interval.
+Writer-side operations use `Client.writer_mu` so expected-revision checks and their transaction cannot be interleaved by another same-process writer.
 
-This gives sub-poll-interval latency on a busy stream and
-falls back to polling on an idle one.
+The lock is adaptive: it spins only for a short bounded fast path, then yields through `std.Io.sleep` while contention continues. This avoids burning a CPU core when the current owner is inside SQLite/WAL I/O.
 
-#### Read connection layout
+Cross-process contention remains governed by SQLite and `PRAGMA busy_timeout`.
 
-Subscription workers (`runStream`, `runAll`, `runPS`) read
-through `Client.read_conn` rather than the writer
-connection. Two options are exposed via `OpenOptions`:
+### WAL reads
 
-- **Default (`separate_read_connection = false`):** the
-  client uses a single SQLite connection shared by writers
-  and subscription workers. This matches the v0.1 model and
-  preserves identical semantics for existing consumers.
-- **Opt-in (`separate_read_connection = true`):** the
-  client opens a second `Connection` in WAL mode and routes
-  subscription reads through it. Writers and readers no
-  longer compete for the same file handle. Under sustained
-  append load this raises the catch-up delivery rate from
-  the historic 500–800 of 1 000 (documented in the pre-fix
-  `tests/stress/concurrent.zig`) to all 1 000 within the
-  same 2 s budget — see `tests/stress/separate_read_conn.zig`
-  for the regression test.
+For file-backed stores, `separate_read_connection = true` opens a second SQLite handle used by subscription workers. This lets WAL readers use a different handle from the serialized writer.
 
-### Persistent subscription delivery
+Plain SQLite `:memory:` is connection-local, so EventsZite rejects `:memory:` together with `separate_read_connection = true`. Two normal `:memory:` handles would otherwise be two unrelated databases presented as one `Client`.
 
-`ConnectPersistentSubscription` adds:
+## Catch-up subscriptions
 
-- A per-group checkpoint (`last_position` on
-  `persistent_subscriptions`).
-- An in-flight table (`persistent_acks`).
+Catch-up workers:
 
-The engine advances the checkpoint on `Ack`. On restart, it
-resumes from the last checkpoint and re-delivers any parked
-or unacked messages.
+1. read from the durable cursor;
+2. enqueue events in order;
+3. advance only after ownership transfers to the queue;
+4. immediately continue when a full page was read;
+5. otherwise wait for append wakeup or poll timeout.
 
----
+`SubscribeOptions.buffer_size` controls an allocator-owned bounded queue. `0` selects the default capacity of 256.
 
-## Compatibility with EventStoreDB
+When the queue is full, the worker applies backpressure. Events are not silently discarded. Closing the subscription/client cancels the wait and frees any event ownership still held by the queue/producer path.
 
-The Zig API is intentionally close to the Go port. The CLI
-covers the basic operational commands (`stats`, `tail`).
-A full HTTP+JSON server is on the roadmap for v0.2.
+Time-based waits use real scheduler-friendly `std.Io.sleep`; `spinLoopHint()` is reserved for short atomic lock acquisition rather than used as a clock.
 
-See [EVENTSTOREDB-COMPATIBILITY.md](./EVENTSTOREDB-COMPATIBILITY.md)
-for the current API surface.
+## Persistent subscription delivery
 
----
+Before a persistent event is handed to the consumer, an in-flight row is durably recorded.
 
-## Performance budget
+ACK processing is serialized and transactional:
 
-Single-process, local SSD, default pragmas, vendored SQLite
-amalgamation:
+1. locate the delivered event by `(group, stream, event_id)`;
+2. mark it `acked = 1`;
+3. find the first incomplete stream revision at or after the current checkpoint;
+4. advance `last_position` only to that contiguous frontier;
+5. commit ACK state and checkpoint atomically.
 
-- **Append**: 20–50k events/sec for small payloads.
-- **Read by stream**: 100k events/sec.
-- **Subscribe latency**: < 10 ms p99 under sustained load.
+Example for delivered revisions `0, 1, 2`:
 
-These are not stress-tested. Run your own benchmark before
-committing to a workload.
+```text
+ACK 2 -> checkpoint 0
+ACK 0 -> checkpoint 1
+ACK 0 -> checkpoint 1  (idempotent duplicate)
+ACK 1 -> checkpoint 3
+```
 
----
+ACKed events beyond a gap remain durable. After restart they are skipped rather than redelivered or reset to incomplete. NACK/park state does not advance the contiguous checkpoint.
 
-## Failure modes
+A file-backed reopen regression test exercises this behavior across actual client close/open cycles.
 
-| Failure | What happens |
+## Client lifetime
+
+`Client.close()` is destructive and deterministic:
+
+1. atomically publish `closed`;
+2. wake/cancel subscription waiters;
+3. wait until `active_workers == 0` using scheduler-friendly waits;
+4. close the optional read connection;
+5. close the writer connection;
+6. release client-owned memory.
+
+The implementation does not intentionally free SQLite/client memory while a registered worker may still dereference it.
+
+## Failure model
+
+| Failure | Contract |
 | --- | --- |
-| Process crash mid-append | WAL rolls back the partial transaction; the next open sees a consistent state. |
-| Disk full | `appendToStream` returns the SQLite I/O error. The Client stays open. |
-| Concurrent process opening same `.db` | SQLite acquires the write lock. Readers see WAL-mode data; writers wait. |
-| Subscriber buffer full | The send blocks. The producer's append is unaffected. |
+| Process crash during append | SQLite/WAL preserves transaction atomicity. |
+| Same-process concurrent writers | Serialized by `writer_mu`. |
+| Cross-process writer contention | SQLite busy timeout applies. |
+| Slow catch-up consumer | Bounded queue backpressures; no silent drop. |
+| Persistent ACKs out of order | Durable checkpoint stops at first incomplete revision. |
+| Restart after later ACK | Durable ACK row is preserved and replay skips that completed revision. |
+| `:memory:` plus separate read handle | Rejected as `UnsupportedConfiguration`. |
 
----
+## Compatibility boundary
 
-## Why Zig
+EventsZite provides an EventStoreDB-inspired embedded programming model. It does not claim EventStoreDB wire-protocol, clustering, replication, gRPC-client, authentication or complete persistent-subscription parity.
 
-- **Single static binary** — no runtime, no glibc mismatch, no
-  cgo-equivalent pain.
-- **No external SQLite dependency** — the amalgamation is
-  vendored and statically linked.
-- **Manual memory management** makes subscription lifetimes
-  obvious and zero-cost.
-- **Build cross-compiles** to Windows / Linux / macOS from any
-  host (`zig build -Dtarget=...`).
+See [`EVENTSTOREDB-COMPATIBILITY.md`](./EVENTSTOREDB-COMPATIBILITY.md) for the maintained statement.
 
----
+## Extension points
 
-## Where to extend
+Current roadmap-level extension points include:
 
-- **gRPC server**: implement the
-  `event_store.client.streams.Streams` and
-  `event_store.client.persistent_subscriptions.PersistentSubscriptions`
-  services from the official proto. Reuse `Client` as the
-  storage layer.
-- **Server-side projections**: a JS engine (V8 / goja /
-  bun.sh) running user-defined projection scripts that
-  consume `$all` and write to side tables. The
-  `projection_checkpoints` table already supports this.
-- **Multi-stream transactions**: extend `appendToStream` to
-  take a list of `(streamID, expectedRevision, events)` tuples
-  and commit them in a single transaction.
-- **Encryption**: switch to SQLCipher by adding the
-  appropriate build flag and PRAGMA key. The schema and API
-  do not change.
+- explicit parked-message replay/resolution;
+- filter subscriptions;
+- multi-stream transaction API;
+- first-class DCB conditional append/read helpers;
+- optional shared-memory URI mode if multi-connection in-memory operation is required;
+- a future versioned package/import rename from `eventstoredb` to `eventszite` without silently breaking consumers.
